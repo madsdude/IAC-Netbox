@@ -1,0 +1,162 @@
+---
+# PLAY 1: Forbered IP'er
+- name: "Forbered de ukendte IP-adresser"
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: "Tilføj fundne IP'er til midlertidig gruppe"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: discovered_routers
+        ansible_connection: network_cli
+        ansible_network_os: ios
+        ansible_user: "{{ onboard_user }}"
+        ansible_password: "{{ onboard_password }}"
+      loop: "{{ target_ips.split(',') }}"
+      when: target_ips is defined
+
+# PLAY 2: Deep Discovery (SSL & Role Logic)
+- name: "Brownfield Onboarding (Full Sync)"
+  hosts: discovered_routers
+  gather_facts: no
+
+  vars:
+    netbox_url: "{{ lookup('ansible.builtin.env', 'NETBOX_URL') }}"
+    netbox_token: "{{ lookup('ansible.builtin.env', 'NETBOX_TOKEN') }}"
+    # LOGIK: Hvis IP indeholder .20., så er det en Switch
+    discovered_role: "{{ 'Switch' if '.20.' in inventory_hostname else 'Router' }}"
+
+  tasks:
+    - name: "1. Hent hardware, interface og VLAN facts"
+      cisco.ios.ios_facts:
+        gather_subset: [hardware, interfaces]
+
+    - name: "1b. Hent VLAN informationer"
+      cisco.ios.ios_vlans:
+        state: gathered
+      register: vlan_output
+
+    - name: "2. Basis Opsætning i NetBox"
+      block:
+        - netbox.netbox.netbox_manufacturer:
+            netbox_url: "{{ netbox_url }}"
+            netbox_token: "{{ netbox_token }}"
+            validate_certs: no
+            data: { name: "Cisco" }
+        - netbox.netbox.netbox_device_role:
+            netbox_url: "{{ netbox_url }}"
+            netbox_token: "{{ netbox_token }}"
+            validate_certs: no
+            data: { name: "{{ item }}", color: "00bcd4" }
+          loop: ["Router", "Switch"]
+        - netbox.netbox.netbox_vlan_group:
+            netbox_url: "{{ netbox_url }}"
+            netbox_token: "{{ netbox_token }}"
+            validate_certs: no
+            data:
+              name: "{{ target_site | upper }}-VLANS"
+              slug: "{{ target_site | lower }}-vlans"
+              scope_type: "dcim.site"
+              scope: { name: "{{ target_site | upper }}" }
+      delegate_to: localhost
+      run_once: true
+
+    - name: "3. Opret/Opdater Enheden"
+      netbox.netbox.netbox_device:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          name: "{{ ansible_net_hostname }}"
+          device_type: "{{ ansible_net_model | upper }}"
+          device_role: "{{ discovered_role }}"
+          site: "{{ target_site }}"
+          serial: "{{ ansible_net_serialnum }}"
+          status: "active"
+        state: present
+      delegate_to: localhost
+
+    - name: "4. SYNC VLANs"
+      netbox.netbox.netbox_vlan:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          name: "{{ item.name }}"
+          vid: "{{ item.vlan_id }}"
+          site: "{{ target_site }}"
+          vlan_group: "{{ target_site | upper }}-VLANS"
+          status: "active"
+        state: present
+      loop: "{{ vlan_output.gathered | default([]) }}"
+      when: "item.vlan_id | int >= 2 and item.vlan_id | int < 1000"
+      delegate_to: localhost
+      run_once: true
+
+    - name: "5. SYNC PREFIXES"
+      netbox.netbox.netbox_prefix:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          prefix: "10.50.{{ (item.vlan_id | int) - 300 }}.0/24"
+          status: "active"
+          vlan: 
+            vid: "{{ item.vlan_id }}"
+            vlan_group: "{{ target_site | upper }}-VLANS"
+        state: present
+      loop: "{{ vlan_output.gathered | default([]) }}"
+      when: "item.vlan_id | int >= 300 and (item.vlan_id | int - 300) <= 255"
+      delegate_to: localhost
+      run_once: true
+
+    - name: "6. SYNC INTERFACES"
+      netbox.netbox.netbox_device_interface:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          device: "{{ ansible_net_hostname }}"
+          name: "{{ item.key }}"
+          type: "1000base-t"
+          enabled: "{{ item.value.enabled | default(true) }}"
+        state: present
+      loop: "{{ ansible_net_interfaces | dict2items }}"
+      delegate_to: localhost
+
+    - name: "7. SYNC MANAGEMENT IP (🌐)"
+      netbox.netbox.netbox_ip_address:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          address: "{{ item.value.ipv4[0].address }}/{{ item.value.ipv4[0].mask | default('255.255.255.0') }}"
+          status: "active"
+          assigned_object:
+            device: "{{ ansible_net_hostname }}"
+            name: "{{ item.key }}"
+        state: present
+      loop: "{{ ansible_net_interfaces | dict2items }}"
+      when: 
+        - item.value.ipv4 is defined
+        - item.value.ipv4 | length > 0
+      delegate_to: localhost
+      # HER ER FIXET: Selvom IP'en findes, så fortsæt til næste opgave!
+      ignore_errors: yes
+
+    - name: "8. SÆT PRIMARY IP PÅ ENHEDEN 🏆"
+      netbox.netbox.netbox_device:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          name: "{{ ansible_net_hostname }}"
+          # Vi linker den IP vi lige har fundet som "Primary"
+          primary_ip4: "{{ item.value.ipv4[0].address }}"
+      loop: "{{ ansible_net_interfaces | dict2items }}"
+      when: 
+        - "item.key == 'Vlan320' or 'Vlan' in item.key"
+        - item.value.ipv4 | length > 0
+      delegate_to: localhost
+      # Vi tillader også fejl her, hvis f.eks. sitet er låst
+      ignore_errors: yes
