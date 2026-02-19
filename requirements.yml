@@ -1,0 +1,5 @@
+---
+collections:
+  - name: fortinet.fortios
+  - name: netbox.netbox
+  - name: cisco.ios
