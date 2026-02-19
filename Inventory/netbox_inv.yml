@@ -1,0 +1,22 @@
+plugin: netbox.netbox.nb_inventory
+api_endpoint: "https://10.36.1.80"
+token: "DdQEEtl583idIa6TtA3avkxsyhxncqPirUO198BM"  # <--- Sæt din token ind her (eller brug env var)
+validate_certs: false
+config_context: false
+
+# Kun aktive enheder
+query_filters:
+  - status: active
+
+# Gruppering (Sites)
+keyed_groups:
+  - prefix: site
+    key: site.slug
+
+# HER ER LØSNINGEN:
+# Vi tvinger variablerne ind på alle enheder, vi finder
+compose:
+  ansible_network_os: "'ios'"
+  ansible_connection: "'network_cli'"
+  ansible_user: "'ansible'"
+  ansible_host: primary_ip4.address | default(name) | regex_replace('/.*', '')
