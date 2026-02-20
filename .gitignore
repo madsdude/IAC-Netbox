@@ -1,0 +1,19 @@
+# Sikkerhed og miljøvariabler
+.env
+secret*.yml
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# Ansible
+*.retry
+
+# Logs og midlertidige filer
+*.log
+netbox_sites_log.json
