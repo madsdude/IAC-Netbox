@@ -1,0 +1,121 @@
+---
+# PLAY 1: Forbered IP'er
+- name: "Forbered de ukendte IP-adresser"
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: "Tilføj fundne IP'er til midlertidig gruppe"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: discovered_routers
+        ansible_connection: network_cli
+        ansible_network_os: ios
+        ansible_user: "{{ onboard_user }}"
+        ansible_password: "{{ onboard_password }}"
+      loop: "{{ target_ips.split(',') }}"
+      when: target_ips is defined
+
+# PLAY 2: Deep Discovery (SSL & Role Logic)
+- name: "Brownfield Onboarding (Full Sync)"
+  hosts: discovered_routers
+  gather_facts: no
+
+  vars:
+    netbox_url: "{{ lookup('ansible.builtin.env', 'NETBOX_URL') }}"
+    netbox_token: "{{ lookup('ansible.builtin.env', 'NETBOX_TOKEN') }}"
+    # LOGIK: Hvis IP indeholder .20., så er det en Switch
+    discovered_role: "{{ 'Switch' if '.20.' in inventory_hostname else 'Router' }}"
+
+  tasks:
+    - name: "1. Hent hardware, interface og VLAN facts"
+      cisco.ios.ios_facts:
+        gather_subset: [hardware, interfaces]
+
+    - name: "2. Basis Opsætning i NetBox"
+      block:
+        - netbox.netbox.netbox_manufacturer:
+            netbox_url: "{{ netbox_url }}"
+            netbox_token: "{{ netbox_token }}"
+            validate_certs: no
+            data: { name: "Cisco" }
+        - netbox.netbox.netbox_device_role:
+            netbox_url: "{{ netbox_url }}"
+            netbox_token: "{{ netbox_token }}"
+            validate_certs: no
+            data: { name: "{{ item }}", color: "00bcd4" }
+          loop: ["Router", "Switch"]
+      delegate_to: localhost
+      run_once: true
+
+    - name: "3. Opret/Opdater Enheden"
+      netbox.netbox.netbox_device:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          name: "{{ ansible_net_hostname }}"
+          device_type: "{{ ansible_net_model | upper }}"
+          device_role: "{{ discovered_role }}"
+          # Nu hvor din Python menu sender exact slug over (f.eks. test-department), bruger vi bare target_site variablen
+          site: "{{ target_site }}"
+          serial: "{{ ansible_net_serialnum }}"
+          status: "active"
+        state: present
+      delegate_to: localhost
+
+    - name: "4. SYNC INTERFACES"
+      netbox.netbox.netbox_device_interface:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          device: "{{ ansible_net_hostname }}"
+          name: "{{ item.key }}"
+          type: "1000base-t"
+          enabled: "{{ item.value.enabled | default(true) }}"
+        state: present
+      loop: "{{ ansible_net_interfaces | dict2items }}"
+      delegate_to: localhost
+
+    - name: "5. SYNC MANAGEMENT IP (🌐)"
+      netbox.netbox.netbox_ip_address:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          address: "{{ item.value.ipv4[0].address }}/{{ item.value.ipv4[0].mask | default('255.255.255.0') }}"
+          status: "active"
+          assigned_object:
+            device: "{{ ansible_net_hostname }}"
+            name: "{{ item.key }}"
+        state: present
+      loop: "{{ ansible_net_interfaces | dict2items }}"
+      when: 
+        - item.value.ipv4 is defined
+        - item.value.ipv4 | length > 0
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: "6. SÆT PRIMARY IP PÅ ENHEDEN 🏆"
+      netbox.netbox.netbox_device:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          name: "{{ ansible_net_hostname }}"
+          primary_ip4: "{{ item.value.ipv4[0].address }}"
+      loop: "{{ ansible_net_interfaces | dict2items }}"
+      when: 
+        - "item.key == 'Vlan320' or 'Vlan' in item.key"
+        - item.value.ipv4 | length > 0
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: "7. Hent alle stack-medlemmer (Show Inventory) 🕵️"
+      cisco.ios.ios_command:
+        commands: "show inventory"
+      register: inventory_raw
+
+    - name: "8. Ekstraher serienumre på alle switches"
+      set_fact:
+        stack_members: "{{ inventory_raw.stdout[0] | regex_findall('SN: (\\w+)') }}"
