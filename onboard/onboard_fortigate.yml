@@ -1,0 +1,297 @@
+---
+# PLAY 1: Forbered FortiGate IP'en
+- name: "Forbered FortiGate IP"
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: "Tilføj firewall IP til midlertidig gruppe"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: discovered_firewalls
+        ansible_connection: local
+      loop: "{{ target_ips.split(',') }}"
+      when: target_ips is defined
+
+# PLAY 2: REST API Discovery & NetBox Onboarding
+- name: "FortiGate HA Onboarding (REST API)"
+  hosts: discovered_firewalls
+  gather_facts: no
+
+  vars:
+    netbox_url: "{{ lookup('ansible.builtin.env', 'NETBOX_URL') }}"
+    netbox_token: "{{ lookup('ansible.builtin.env', 'NETBOX_TOKEN') }}"
+    fortigate_token: "{{ lookup('ansible.builtin.env', 'FORTIGATE_API_TOKEN') }}"
+
+  tasks:
+    - name: "1. Hent System Status fra FortiGate (Master) 🕵️"
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/api/v2/monitor/system/status"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ fortigate_token }}"
+        validate_certs: no
+        return_content: yes
+      register: fg_status
+
+    - name: "1b. Udled Short Name fra Firewallens navn (TST-FW01 -> TST) 🧠"
+      set_fact:
+        fw_short_name: "{{ fg_status.json.results.hostname.split('-')[0] | upper }}"
+      when: fg_status.json.results.hostname is defined
+
+    - name: "1c. Slå Site op i NetBox via Custom Field (cf_short) 🕵️"
+      ansible.builtin.uri:
+        url: "{{ netbox_url }}/api/dcim/sites/?cf_short={{ fw_short_name }}"
+        method: GET
+        headers:
+          Authorization: "Token {{ netbox_token }}"
+          Accept: "application/json"
+        validate_certs: no
+      register: nb_site_search
+      delegate_to: localhost
+
+    - name: "1d. Hent Site Slug og SiteID 🎯"
+      set_fact:
+        fw_site_slug: "{{ nb_site_search.json.results[0].slug }}"
+        fw_site_id: "{{ nb_site_search.json.results[0].custom_fields.site_id | default('0') }}"
+      when: nb_site_search.json.count > 0
+
+    - name: "1e. Fejlhåndtering hvis Sitet ikke findes 🛑"
+      ansible.builtin.fail:
+        msg: "KRITISK FEJL: Kunne ikke finde et Site i NetBox, hvor Custom Field 'short' er lig med '{{ fw_short_name }}'. Opret sitet i NetBox først!"
+      when: nb_site_search.json.count == 0
+
+    - name: "2. Hent HA Status (Cluster Info) 👯‍♂️"
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/api/v2/cmdb/system/ha"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ fortigate_token }}"
+        validate_certs: no
+        return_content: yes
+      register: fg_ha
+      ignore_errors: yes
+
+    - name: "3. Hent alle Interfaces & IP'er (CMDB Configuration) 🔌"
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/api/v2/cmdb/system/interface"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ fortigate_token }}"
+        validate_certs: no
+        return_content: yes
+      register: fg_interfaces_cmdb
+
+    - name: "4. Opret Basis Opsætning i NetBox (Fortinet & Firewall)"
+      block:
+        - netbox.netbox.netbox_manufacturer:
+            netbox_url: "{{ netbox_url }}"
+            netbox_token: "{{ netbox_token }}"
+            validate_certs: no
+            data: { name: "Fortinet", slug: "fortinet" }
+        - netbox.netbox.netbox_device_role:
+            netbox_url: "{{ netbox_url }}"
+            netbox_token: "{{ netbox_token }}"
+            validate_certs: no
+            data: { name: "Firewall", color: "ff9800" }
+        - netbox.netbox.netbox_device_type:
+            netbox_url: "{{ netbox_url }}"
+            netbox_token: "{{ netbox_token }}"
+            validate_certs: no
+            data:
+              manufacturer: "Fortinet"
+              model: "FortiGate HA Cluster"
+              slug: "fortigate-ha-cluster"
+      delegate_to: localhost
+      run_once: true
+
+    - name: "5. Opret den Aktive FortiGate (Master) i NetBox 🏆"
+      netbox.netbox.netbox_device:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          name: "{{ fg_status.json.results.hostname | default('FortiGate-Master') }}"
+          device_type: "FortiGate HA Cluster"
+          device_role: "Firewall"
+          site: "{{ fw_site_slug }}" 
+          serial: "{{ fg_status.json.results.serial | default('') }}"
+          status: "active"
+      delegate_to: localhost
+
+    - name: "5b. Opret Virtual Chassis (HA Cluster) i NetBox 🔗"
+      netbox.netbox.netbox_virtual_chassis:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          name: "HA-{{ fw_short_name }}"
+      when: 
+        - fg_ha.json is defined
+        - fg_ha.json.results.mode != "standalone"
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: "5c. Knyt Master til Virtual Chassis"
+      netbox.netbox.netbox_device:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          name: "{{ fg_status.json.results.hostname | default('FortiGate-Master') }}"
+          virtual_chassis: "HA-{{ fw_short_name }}"
+          vc_position: 1
+      when: 
+        - fg_ha.json is defined
+        - fg_ha.json.results.mode != "standalone"
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: "5d. Opret den Passive FortiGate (Slave) i NetBox 🛡️"
+      netbox.netbox.netbox_device:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          name: >-
+            {{ 
+               fg_status.json.results.hostname | replace('-N1', '-N2') 
+               if '-N1' in fg_status.json.results.hostname 
+               else fg_status.json.results.hostname ~ '-Passive' 
+            }}
+          device_type: "FortiGate HA Cluster"
+          device_role: "Firewall"
+          site: "{{ fw_site_slug }}" 
+          status: "active"
+          virtual_chassis: "HA-{{ fw_short_name }}"
+          vc_position: 2
+      when: 
+        - fg_ha.json is defined
+        - fg_ha.json.results.mode != "standalone"
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: "6a. SYNC Fysiske & Aggregate Interfaces (Forældre) 🔌"
+      netbox.netbox.netbox_device_interface:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          device: "{{ fg_status.json.results.hostname | default('FortiGate-Master') }}"
+          name: "{{ item.name }}"
+          type: "{{ 'lag' if item.type == 'aggregate' else '1000base-t' }}"
+          enabled: "{{ item.status == 'up' }}"
+          mac_address: "{{ item.macaddr | default(item.mac) | default(omit) }}"
+          description: "{{ item.alias | default('') }}"
+      loop: "{{ fg_interfaces_cmdb.json.results | default([]) }}"
+      when: 
+        - item.name is defined
+        - item.type in ['physical', 'aggregate']
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: "6a.4. Opret VLAN Gruppe med korrekt Scope 📁"
+      netbox.netbox.netbox_vlan_group:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          name: "{{ fw_short_name }}-VLANS"
+          slug: "{{ fw_short_name | lower }}-vlans"
+          scope_type: "dcim.site"
+          scope: "{{ fw_site_slug }}"
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: "6a.5. Opret VLANs i NetBox IPAM 🏷️"
+      netbox.netbox.netbox_vlan:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          name: "{{ item.alias if item.alias != '' else item.name }}"
+          vid: "{{ item.vlanid }}"
+          site: "{{ fw_site_slug }}"
+          status: "active"
+          vlan_group: "{{ fw_short_name }}-VLANS"
+      loop: "{{ fg_interfaces_cmdb.json.results | default([]) }}"
+      when: 
+        - item.name is defined
+        - item.type == 'vlan'
+        - item.vlanid is defined
+        - item.vlanid | int > 0
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: "6a.6. Opret Subnet (Prefix) med korrekt Scope 🌍"
+      netbox.netbox.netbox_prefix:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          prefix: "{{ item.ip.split(' ')[0].split('.')[0:3] | join('.') }}.0/24"
+          status: "active"
+          scope_type: "dcim.site"
+          scope: "{{ fw_site_slug }}"
+          vlan:
+            name: "{{ item.alias if item.alias != '' else item.name }}"
+            site: "{{ fw_site_slug }}"
+      loop: "{{ fg_interfaces_cmdb.json.results | default([]) }}"
+      when: 
+        - item.name is defined
+        - item.type == 'vlan'
+        - item.ip is defined
+        - "'255.255.255.0' in item.ip"
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: "6b. SYNC VLAN Sub-interfaces (Børnene) 👨‍👦"
+      netbox.netbox.netbox_device_interface:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          device: "{{ fg_status.json.results.hostname | default('FortiGate-Master') }}"
+          name: "{{ item.name }}"
+          type: "virtual"
+          enabled: "{{ item.status == 'up' }}"
+          parent_interface: "{{ item.interface | default(omit) }}"
+          description: "{{ item.alias | default('') }}"
+          mode: "access"
+      loop: "{{ fg_interfaces_cmdb.json.results | default([]) }}"
+      when: 
+        - item.name is defined
+        - item.type == 'vlan'
+        - item.interface is defined
+        - item.interface != ''
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: "7. SYNC IP Adresser (Gateways) 🌐"
+      netbox.netbox.netbox_ip_address:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          address: >-
+            {{ 
+               item.ip.split(' ')[0] ~ 
+               (
+                 '/24' if '255.255.255.0' in item.ip else 
+                 '/29' if '255.255.255.248' in item.ip else
+                 '/30' if '255.255.255.252' in item.ip else
+                 '/32' if '255.255.255.255' in item.ip else
+                 '/16' if '255.255.0.0' in item.ip else '/24'
+               ) 
+            }}
+          status: "active"
+          assigned_object:
+            device: "{{ fg_status.json.results.hostname | default('FortiGate-Master') }}"
+            name: "{{ item.name }}"
+      loop: "{{ fg_interfaces_cmdb.json.results | default([]) }}"
+      when: 
+        - item.ip is defined
+        - "'0.0.0.0' not in item.ip"
+        - "item.ip != ''"
+        - item.type in ['physical', 'aggregate', 'vlan']
+      delegate_to: localhost
+      ignore_errors: yes
