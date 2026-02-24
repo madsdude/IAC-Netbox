@@ -18,11 +18,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ==========================================
 
 SEMAPHORE_URL = "http://10.36.0.104:3000/api"
-SEMAPHORE_TOKEN = "TOKEN" 
+SEMAPHORE_TOKEN = os.getenv("SEMAPHORE_TOKEN", "TOKEN") 
 PROJECT_ID = 3
 
 NETBOX_URL = "https://10.36.1.80"           
-NETBOX_TOKEN = "TOKEN"       
+NETBOX_TOKEN = os.getenv("NETBOX_TOKEN", "TOKEN")       
 SSH_USER = "ansible"                        
 
 # ==========================================
