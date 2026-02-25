@@ -1,0 +1,90 @@
+---
+- name: "Forbered de valgte IP-adresser"
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: "Tilføj fundne IP'er til midlertidig gruppe"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: discovered_switches
+        ansible_connection: network_cli
+        ansible_network_os: ios
+        ansible_user: "{{ onboard_user }}"
+        ansible_password: "{{ onboard_password }}"
+      loop: "{{ target_ips.split(',') }}"
+      when: target_ips is defined
+
+- name: "LLDP Topology & Endpoint Mapper"
+  hosts: discovered_switches
+  gather_facts: no
+
+  vars:
+    netbox_url: "{{ lookup('ansible.builtin.env', 'NETBOX_URL') }}"
+    netbox_token: "{{ lookup('ansible.builtin.env', 'NETBOX_TOKEN') }}"
+
+  tasks:
+    - name: "1. Hent Switch Hostname 🕵️"
+      cisco.ios.ios_facts:
+        gather_subset: [min]
+
+    - name: "2. Kør 'show lldp neighbors detail' 📡"
+      cisco.ios.ios_command:
+        commands: "show lldp neighbors detail"
+      register: lldp_raw
+
+    - name: "3. Ekstraher LLDP data via RegEx 🧙‍♂️"
+      # LLDP format:
+      # Local Intf: Gi1/0/1
+      # Port id: Gi1/0/48 (eller en MAC adresse for endpoints)
+      # System Name: TST-SW20
+      # System Description: Cisco IOS Software...
+      set_fact:
+        lldp_neighbors: >-
+          {{ lldp_raw.stdout[0] | regex_findall('(?s)Local Intf:\s*([^\n\r]+).*?Port id:\s*([^\n\r]+).*?System Name:\s*([^\n\r]+).*?System Description:\s*([^\n\r]+)') }}
+      when: lldp_raw.stdout is defined and lldp_raw.stdout[0] != ""
+
+    - name: "4. DOKUMENTER ENDPOINTS (Telefoner, Linux, APs) i Description 📝"
+      netbox.netbox.netbox_device_interface:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          device: "{{ ansible_net_hostname }}"
+          # item[0] er vores Lokale port (F.eks. Gi1/0/1)
+          name: "{{ item[0].strip() }}"
+          # Vi klipper System Description ned til 30 tegn, fordi LLDP ellers skriver hele iOS versionen ind!
+          description: "[LLDP] {{ item[2].strip().split('.')[0] }} ({{ item[3][:30].strip() }}...)"
+      loop: "{{ lldp_neighbors | default([]) }}"
+      # LOGIK: Vi opdaterer kun beskrivelsen, hvis det IKKE er en switch
+      when: 
+        - lldp_neighbors is defined
+        - "'Cisco IOS' not in item[3] and 'IOS-XE' not in item[3]"
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: "5. TRÆK KABLER MELLEM SWITCHES 🧵"
+      netbox.netbox.netbox_cable:
+        netbox_url: "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        validate_certs: no
+        data:
+          status: "connected"
+          termination_a_type: "dcim.interface"
+          termination_a:
+            device: "{{ ansible_net_hostname }}"
+            # item[0] = Lokal port
+            name: "{{ item[0].strip() }}"
+          termination_b_type: "dcim.interface"
+          termination_b:
+            # item[2] = Remote Switch Name
+            device: "{{ item[2].strip().split('.')[0] }}"
+            # item[1] = Remote Port
+            name: "{{ item[1].strip() }}"
+      loop: "{{ lldp_neighbors | default([]) }}"
+      # LOGIK: Vi trækker KUN kabler, hvis naboen ER en switch (baseret på beskrivelsen)
+      when: 
+        - lldp_neighbors is defined
+        - "'Cisco IOS' in item[3] or 'IOS-XE' in item[3]"
+      delegate_to: localhost
+      throttle: 1  # Forhindrer Database Deadlocks, præcis som vi lærte i CDP!
+      ignore_errors: yes
