@@ -57,6 +57,31 @@ graph TD
     end
 ```
 
+```graph TD
+    User([User]) --> ControlScript[control.py CLI]
+    ServiceNow[(ServiceNow ITSM)] -. Webhook/API .-> Semaphore{Semaphore}
+    
+    ControlScript -- REST API --> Semaphore
+    ControlScript -- REST API --> NetBox[(NetBox SoT)]
+    
+    Semaphore -- Run Playbook --> Ansible[Ansible Engine]
+    Semaphore -- Webhook Alerts --> Webex([Webex])
+    
+    Ansible -- API/SSH --> NetworkDevices[Network Devices<br/>Cisco / FortiGate / Aruba WLC]
+    Ansible -- REST API --> NetBox
+    Ansible -- API Updates --> ServiceNow
+    Ansible -- Notifikationer --> Webex
+    
+    subgraph "Onboarding Flow"
+    NetworkDevices -- Data Discovery --> Ansible
+    Ansible -- Create/Update --> NetBox
+    end
+    
+    subgraph "Brownfield Discovery"
+    ControlScript -- TCP Scan 22 --> NetworkDevices
+    ControlScript -- IP List --> Semaphore
+    end
+```
 ## Key Workflows
 
 ### Brownfield Discovery & Onboarding
