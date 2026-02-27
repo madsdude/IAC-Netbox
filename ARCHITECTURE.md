@@ -86,6 +86,96 @@ graph TD
     ControlScript -- IP List --> Semaphore
     end
 ```
+```mermaid
+graph TD
+    %% --- BRUGER & CHATOPS ---
+    subgraph "User & ChatOps (Frontend)"
+        User([Network Engineer]) --> ControlScript[control.py CLI]
+        Webex([Webex Teams / Slack])
+    end
+
+    %% --- CI/CD & ITSM (Governance) ---
+    subgraph "Governance & Pipeline"
+        GitLab[(GitLab / GitHub)]
+        ServiceNow[(ServiceNow ITSM)]
+    end
+
+    %% --- ORCHESTRATION & SIKKERHED ---
+    subgraph "Automation Core"
+        Semaphore{Semaphore HA Cluster}
+        Ansible[Ansible Execution Nodes]
+        Vault[(HashiCorp Vault)]
+    end
+
+    %% --- SOURCE OF TRUTH & IDENTITY ---
+    subgraph "Source of Truth & IAM"
+        NetBox[(NetBox SoT Cluster)]
+        ISE[(Cisco ISE / ClearPass NAC)]
+        AD[(Active Directory / Entra ID)]
+    end
+
+    %% --- INFRASTRUKTUR (Edge, Core & Cloud) ---
+    subgraph "Global Network Infrastructure"
+        Cisco[Cisco Core & Edge Switches]
+        FortiGate[FortiGate HA Firewalls]
+        ArubaWLC[Aruba WLC Cluster]
+        ArubaAPs[Aruba Access Points]
+        Cloud[AWS / Azure Transit Network]
+    end
+
+    %% --- OVERVÅGNING & LOGGING ---
+    subgraph "Observability"
+        Splunk[(Splunk / ELK SIEM)]
+        SolarWinds[(SolarWinds / Datadog)]
+    end
+
+    %% ==========================================
+    %% FORBINDELSER OG DATAFLOWS
+    %% ==========================================
+
+    %% Bruger interaktion
+    ControlScript -- REST API --> Semaphore
+    ControlScript -- Læser Data --> NetBox
+
+    %% Governance triggers
+    GitLab -. Push Webhook .-> Semaphore
+    ServiceNow -. Godkendt Change Request .-> Semaphore
+    Semaphore -- Sender Approvals / Status --> Webex
+
+    %% Orchestration execution
+    Semaphore -- Henter API Tokens/SSH Keys --> Vault
+    Semaphore -- Kører Playbooks --> Ansible
+
+    %% Ansible Automatisering
+    Ansible -- API (Sync/Create) --> NetBox
+    Ansible -- Opdaterer MAC/Regler --> ISE
+    Ansible -- API (Lukker Ticket) --> ServiceNow
+    Ansible -- Sender Audit Logs --> Splunk
+
+    %% Netværkskonfiguration (Sydgående)
+    Ansible -- SSH / NETCONF --> Cisco
+    Ansible -- REST API --> FortiGate
+    Ansible -- API / SSH --> ArubaWLC
+    Ansible -- API (Terraform/Ansible) --> Cloud
+
+    %% Intern Netværkslogik
+    ArubaWLC -. Manager & Controller .-> ArubaAPs
+    AD -- Bruger/Enheds Auth --> ISE
+    ISE -- RADIUS/TACACS+ --> Cisco
+    ISE -- RADIUS/TACACS+ --> FortiGate
+    ISE -- RADIUS/TACACS+ --> ArubaWLC
+
+    %% Onboarding Flow (Nordgående)
+    Cisco -- Telemetry / Facts --> Ansible
+    ArubaAPs -- AP Data (via WLC) --> Ansible
+    FortiGate -- HA Status --> Ansible
+
+    %% Overvågning
+    Cisco -. SNMP / Telemetry .-> SolarWinds
+    FortiGate -. Syslog .-> Splunk
+    SolarWinds -. Opretter Incident Ticket .-> ServiceNow
+```
+
 ## Key Workflows
 
 ### Brownfield Discovery & Onboarding
