@@ -69,12 +69,15 @@ graph TD
     Semaphore -- Webhook Alerts --> Webex([Webex])
     
     Ansible -- API/SSH --> NetworkDevices[Network Devices<br/>Cisco / FortiGate / Aruba WLC]
+    NetworkDevices -. Manages .-> ArubaAPs[Aruba Access Points]
+    
     Ansible -- REST API --> NetBox
     Ansible -- API Updates --> ServiceNow
     Ansible -- Notifikationer --> Webex
     
     subgraph "Onboarding Flow"
-    NetworkDevices -- Data Discovery --> Ansible
+    NetworkDevices -- Device Data --> Ansible
+    ArubaAPs -- AP Data (via WLC) --> Ansible
     Ansible -- Create/Update --> NetBox
     end
     
