@@ -57,7 +57,8 @@ graph TD
     end
 ```
 
-```graph TD
+```mermaid
+graph TD
     User([User]) --> ControlScript[control.py CLI]
     ServiceNow[(ServiceNow ITSM)] -. Webhook/API .-> Semaphore{Semaphore}
     
